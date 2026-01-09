@@ -338,7 +338,7 @@ end
 # ----------------------------
 function main(; method::Symbol=:bh, do_plot::Bool=false, seed::Int=0)
     r, v = initialize(seed=seed)
-    ws = RK4Workspace(N)
+    ws = RK4Workspace(length(r))
 
     for step in 1:max_steps
         println(step)
