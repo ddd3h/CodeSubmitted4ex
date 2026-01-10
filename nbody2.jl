@@ -30,16 +30,51 @@ const Vec2 = SVector{2,Float64}
 # ----------------------------
 # 初期化
 # ----------------------------
-function initialize2(; seed::Int=0)
+# 初期位置分布:
+#   デフォルトでは一様分布 Uniform(-2, 2) を用いる（正方形領域内に一様に配置）。
+#   以前は Normal(0, 1) を用いており、より銀河形成などに近い
+#   ガウス分布を使いたい場合は、たとえば
+#       initialize(position_dist = Normal(0, 1))
+#   のように明示的に分布を指定してください。
+#
+# 初期速度:
+#   デフォルトでは速度ゼロ (random_velocities=false) を用いる。
+#   以前のコードのように Normal(0, 1) から生成し全粒子の平均速度を引く場合は
+#       initialize(random_velocities = true)
+#   のように指定してください。
+function initialize(; seed::Int=0, position_dist::Distribution=Uniform(-2, 2), random_velocities::Bool=false)
     seed != 0 && Random.seed!(seed)
     r0 = Vector{Vec2}(undef, N)
     v0 = Vector{Vec2}(undef, N)
 
-    dist = Uniform(-2, 2)
+    # 位置は指定された分布から初期化
     @inbounds for i in 1:N
-        r0[i] = Vec2(rand(dist), rand(dist))
-        v0[i] = Vec2(0.0, 0.0)
+        r0[i] = Vec2(rand(position_dist), rand(position_dist))
     end
+
+    if random_velocities
+        # 旧コードと同様: Normal(0,1) から生成し，全粒子の平均速度を引く
+        vdist = Normal(0.0, 1.0)
+        tmp_v = Vector{Vec2}(undef, N)
+        v_sum = Vec2(0.0, 0.0)
+        @inbounds for i in 1:N
+            vx = rand(vdist)
+            vy = rand(vdist)
+            vi = Vec2(vx, vy)
+            tmp_v[i] = vi
+            v_sum += vi
+        end
+        v_mean = v_sum / N
+        @inbounds for i in 1:N
+            v0[i] = tmp_v[i] - v_mean
+        end
+    else
+        # デフォルト: 速度をゼロで初期化
+        @inbounds for i in 1:N
+            v0[i] = Vec2(0.0, 0.0)
+        end
+    end
+
     return r0, v0
 end
 
@@ -84,6 +119,13 @@ end
     n.mass = newmass
 end
 
+# 最小セルサイズ（これ以下には分割しない）= 無限再帰を防ぐ
+# この値は粒子が完全に同じ位置にある場合や数値誤差で区別できない場合に、
+# 無限に細分化されるのを防ぐために設定される。
+# 1e-10 はソフトニングパラメータ eps2 = 0.01^2 = 1e-4 よりも十分小さく、
+# 物理的に意味のある距離スケールよりも小さい値として選択されている。
+const MIN_CELL_SIZE = 1e-10
+
 function insert!(n::Node, i::Int, pos::Vector{Vec2})
     p = pos[i]
     update_mass_com!(n, M, p)
@@ -91,6 +133,16 @@ function insert!(n::Node, i::Int, pos::Vector{Vec2})
     # 葉が空なら格納
     if n.idx == 0 && all(x -> x === nothing, n.child)
         n.idx = i
+        return
+    end
+
+    # セルサイズが最小値以下なら分割しない（同位置粒子の無限再帰を防ぐ）
+    if n.h < MIN_CELL_SIZE
+        # この場合、既存粒子と新粒子が同じセルに共存することになる。
+        # idx は既存粒子のインデックスを保持するが、質量・重心は両方の粒子を反映している。
+        # Barnes-Hut の力計算では、このノード全体の質量・重心が使われるため、
+        # 極めて近接した粒子同士の相互作用は正しく近似される。
+        # （個別の粒子として扱われないが、質量中心としては両方が考慮される）
         return
     end
 
@@ -158,6 +210,7 @@ function force_from_node(i::Int, r::Vec2, n::Node)
     dr = r - n.com
     d2 = dr[1]^2 + dr[2]^2 + eps2
     d  = sqrt(d2)
+    # s は正方形領域の辺の長さ（half-width h の2倍）
     s  = 2n.h
 
     # 子が無い＝葉、または十分遠い＝近似OK
@@ -223,27 +276,28 @@ end
 
 function update_rk4!(r::Vector{Vec2}, v::Vector{Vec2}, ws::RK4Workspace; method::Symbol=:bh)
     accel = (method == :bh) ? calc_accel_bh : calc_accel_naive
+    n = length(r)
 
     # k1 = v, l1 = a(r)
     ws.k1 .= v
     ws.l1 .= accel(r)
 
     # rtmp = r + dt/2*k1, vtmp = v + dt/2*l1
-    @inbounds for i in 1:N
+    @inbounds for i in 1:n
         ws.rtmp[i] = r[i] + (dt/2)*ws.k1[i]
         ws.vtmp[i] = v[i] + (dt/2)*ws.l1[i]
     end
     ws.k2 .= ws.vtmp
     ws.l2 .= accel(ws.rtmp)
 
-    @inbounds for i in 1:N
+    @inbounds for i in 1:n
         ws.rtmp[i] = r[i] + (dt/2)*ws.k2[i]
         ws.vtmp[i] = v[i] + (dt/2)*ws.l2[i]
     end
     ws.k3 .= ws.vtmp
     ws.l3 .= accel(ws.rtmp)
 
-    @inbounds for i in 1:N
+    @inbounds for i in 1:n
         ws.rtmp[i] = r[i] + dt*ws.k3[i]
         ws.vtmp[i] = v[i] + dt*ws.l3[i]
     end
@@ -251,7 +305,7 @@ function update_rk4!(r::Vector{Vec2}, v::Vector{Vec2}, ws::RK4Workspace; method:
     ws.l4 .= accel(ws.rtmp)
 
     # r, v を更新
-    @inbounds for i in 1:N
+    @inbounds for i in 1:n
         k = (ws.k1[i] + 2ws.k2[i] + 2ws.k3[i] + ws.k4[i]) / 6
         l = (ws.l1[i] + 2ws.l2[i] + 2ws.l3[i] + ws.l4[i]) / 6
         r[i] = r[i] + dt*k
@@ -263,7 +317,7 @@ end
 # ----------------------------
 # 描画
 # ----------------------------
-function pplot(r::Vector{Vec2}, step::Int; outdir::String="img")
+function save_snapshot(r::Vector{Vec2}, step::Int; outdir::String="img")
     isdir(outdir) || mkpath(outdir)
     x = Vector{Float64}(undef, length(r))
     y = Vector{Float64}(undef, length(r))
@@ -283,13 +337,13 @@ end
 # main
 # ----------------------------
 function main(; method::Symbol=:bh, do_plot::Bool=false, seed::Int=0)
-    r, v = initialize2(seed=seed)
-    ws = RK4Workspace(N)
+    r, v = initialize(seed=seed)
+    ws = RK4Workspace(length(r))
 
     for step in 1:max_steps
         println(step)
         update_rk4!(r, v, ws; method=method)
-        do_plot && pplot(r, step)
+        do_plot && save_snapshot(r, step)
     end
 end
 
